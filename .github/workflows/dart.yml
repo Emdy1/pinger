@@ -17,13 +17,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      # Install dependencies (e.g., CocoaPods)
-      - name: Install CocoaPods
-        run: |
-          sudo gem install cocoapods
-          pod install --repo-update
-
-      # Set up Xcode version
+      # Set up Xcode version manually
       - name: Set up Xcode version
         run: sudo xcode-select -s /Applications/Xcode_15.2.app/Contents/Developer
 
