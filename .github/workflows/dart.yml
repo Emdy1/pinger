@@ -1,0 +1,50 @@
+name: Build iOS App
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  build:
+    runs-on: macos-latest
+
+    steps:
+      # Checkout the repository
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # Install dependencies (CocoaPods example, skip if not needed)
+      - name: Install CocoaPods
+        run: |
+          sudo gem install cocoapods
+          pod install --repo-update
+
+      # Set up Xcode
+      - name: Set up Xcode
+        uses: maxim-lobanov/setup-xcode@v3
+        with:
+          xcode-version: '15.2'  # Change to your Xcode version
+
+      # Build the app
+      - name: Build iOS app
+        run: |
+          xcodebuild -workspace YourApp.xcworkspace \
+                     -scheme YourApp \
+                     -sdk iphoneos \
+                     -configuration Release \
+                     -archivePath ${{ github.workspace }}/build/YourApp.xcarchive archive
+          xcodebuild -exportArchive \
+                     -archivePath ${{ github.workspace }}/build/YourApp.xcarchive \
+                     -exportPath ${{ github.workspace }}/build \
+                     -exportOptionsPlist ExportOptions.plist
+
+      # Upload the artifact
+      - name: Upload IPA
+        uses: actions/upload-artifact@v3
+        with:
+          name: ios-app
+          path: build/*.ipa
