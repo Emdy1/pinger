@@ -1,7 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
-import 'package:flutter/services.dart'; // <-- new
+import 'package:flutter/services.dart';
 import 'package:flutter/material.dart';
 
 void main() {
@@ -49,10 +49,26 @@ class _MyHomePageState extends State<MyHomePage> {
   String _clientHost = '127.0.0.1';
   int _clientPort = 8080;
   final List<String> _clientLogs = [];
-  final Map<String, int> _pendingPings = {}; // id -> send timestamp ms
+
+  // pending timestamps keyed by the message payload.
+  // each pending entry is a map { 'sentMs': int, 'server': String }
+  final Map<String, List<Map<String, dynamic>>> _pendingPings = {};
+
+  // Per-server collected RTTs (ms)
+  final Map<String, List<int>> _rttsByServer = {};
+  final Map<String, double> _avgByServer = {};
+  final Map<String, int> _lastRttByServer = {};
+
+  // Per-server sample records (one card per ping): { 'rtt': int, 'ts': int }
+  final Map<String, List<Map<String, dynamic>>> _samplesByServer = {};
 
   // Discovered local addresses (each entry has 'ip' and 'label')
   final List<Map<String, String>> _localAddrs = [];
+
+  // ping flow control
+  bool _pingInProgress = false;
+  int _pingCount = 10;
+  int _pingIntervalMs = 1000;
 
   // UI helpers
   final ScrollController _logScroll = ScrollController();
@@ -97,7 +113,6 @@ class _MyHomePageState extends State<MyHomePage> {
       _localAddrs.add({'ip': '10.0.2.2', 'label': '10.0.2.2 (Android emulator host)'});
     }
 
-    // NOTE: do not overwrite user-entered client host; server IPs are only given (display/copy).
     setState(() {});
   }
 
@@ -253,42 +268,91 @@ class _MyHomePageState extends State<MyHomePage> {
   }
 
   void _handleClientMessage(dynamic message) {
-    // Expecting messages of form: PING:<id>:<sentMs>
-    // We echo same payload from server, so client receives what it sent.
+    // Expecting simple echoed messages (e.g. the client's IP string).
     try {
       final text = message.toString();
       _appendClientLog('Received: $text');
-      if (text.startsWith('PING:')) {
-        final parts = text.split(':');
-        if (parts.length >= 3) {
-          final id = parts[1];
-          final sentMs = int.tryParse(parts[2]);
-          if (sentMs != null && _pendingPings.containsKey(id)) {
-            final now = DateTime.now().millisecondsSinceEpoch;
-            final rtt = now - _pendingPings.remove(id)!;
-            final latency = rtt / 2;
-            _appendClientLog(
-              'Ping $id RTT=${rtt}ms latency=${latency.toStringAsFixed(1)}ms',
-            );
-          }
-        }
+
+      // Use the echoed text as the key to match a pending send time.
+      if (_pendingPings.containsKey(text) && _pendingPings[text]!.isNotEmpty) {
+        final meta = _pendingPings[text]!.removeAt(0);
+        if (_pendingPings[text]!.isEmpty) _pendingPings.remove(text);
+        final sentMs = meta['sentMs'] as int;
+        final server = meta['server'] as String;
+        final now = DateTime.now().millisecondsSinceEpoch;
+        final rtt = now - sentMs;
+
+        // store per-server results and a sample record (one card per ping)
+        _rttsByServer.putIfAbsent(server, () => []).add(rtt);
+        _lastRttByServer[server] = rtt;
+        _samplesByServer.putIfAbsent(server, () => []).add({'rtt': rtt, 'ts': now});
+
+        _appendClientLog('Msg="$text" RTT=${rtt}ms');
+        // update UI immediately so cards appear as pings return
+        setState(() {});
       }
     } catch (e) {
       _appendClientLog('Error handling message: $e');
     }
   }
 
-  void _sendPing() {
+  // send a single simple message (payload is the device/client IP or configured host)
+  void _sendPingOne() {
     if (!_clientConnected || _webSocket == null) {
       _appendClientLog('Not connected');
       return;
     }
-    final id = DateTime.now().microsecondsSinceEpoch.toString();
+
+    final clientIp = _localAddrs.isNotEmpty ? _localAddrs.first['ip']! : _clientHost;
+    final payload = clientIp;
     final nowMs = DateTime.now().millisecondsSinceEpoch;
-    final payload = 'PING:$id:$nowMs';
-    _pendingPings[id] = nowMs;
+    // store server that we are targeting for this ping (use current target host)
+    _pendingPings.putIfAbsent(payload, () => <Map<String, dynamic>>[]).add({
+      'sentMs': nowMs,
+      'server': _clientHost,
+    });
     _webSocket!.add(payload);
-    _appendClientLog('Sent ping $id');
+    _appendClientLog('Sent msg="$payload" at ${nowMs}ms -> server=$_clientHost');
+  }
+
+  // run N pings spaced by intervalMs and compute average (results saved per server)
+  Future<void> _runPingSequence({int count = 10, int intervalMs = 1000}) async {
+    if (_pingInProgress) return;
+    if (!_clientConnected || _webSocket == null) {
+      _appendClientLog('Cannot start pings: client not connected');
+      return;
+    }
+
+    _pingInProgress = true;
+    setState(() {});
+
+    // clear previous results for this server
+    final server = _clientHost;
+    _rttsByServer[server] = [];
+    _avgByServer.remove(server);
+    _lastRttByServer.remove(server);
+    _samplesByServer[server] = [];
+
+    for (int i = 0; i < count; i++) {
+      _sendPingOne();
+      await Future.delayed(Duration(milliseconds: intervalMs));
+    }
+
+    // allow a short grace period for last echoes to arrive
+    await Future.delayed(const Duration(seconds: 2));
+
+    // compute avg if responses arrived
+    final list = _rttsByServer[server] ?? [];
+    if (list.isNotEmpty) {
+      final avg = list.reduce((a, b) => a + b) / list.length;
+      _avgByServer[server] = avg;
+      _appendClientLog('Completed $count pings to $server — avg RTT=${avg.toStringAsFixed(1)}ms');
+    } else {
+      _appendClientLog('No responses from $server');
+    }
+
+    _pingInProgress = false;
+    setState(() {});
   }
 
   void _scrollLogs() {
@@ -460,8 +524,10 @@ class _MyHomePageState extends State<MyHomePage> {
                 ),
                 const SizedBox(width: 12),
                 ElevatedButton(
-                  onPressed: _sendPing,
-                  child: const Text('Send Ping'),
+                  onPressed: _pingInProgress || !_clientConnected
+                      ? null
+                      : () => _runPingSequence(count: _pingCount, intervalMs: _pingIntervalMs),
+                  child: Text(_pingInProgress ? 'Pinging...' : 'Start 10 pings'),
                 ),
                 const SizedBox(width: 12),
                 ElevatedButton(
@@ -477,45 +543,98 @@ class _MyHomePageState extends State<MyHomePage> {
   }
 
   Widget _buildLogs() {
-    final logs = _mode == Mode.server ? _serverLogs : _clientLogs;
-    final title = _mode == Mode.server ? 'Server Logs' : 'Client Logs';
-    return Card(
-      child: Column(
-        children: [
-          ListTile(
-            title: Text(title),
-            subtitle: Text(
-              _mode == Mode.server
-                  ? (_serverRunning
-                        ? 'Running on port $_serverPort'
-                        : 'Stopped')
-                  : (_clientConnected
-                        ? 'Connected to $_clientHost:$_clientPort'
-                        : 'Disconnected'),
+    if (_mode == Mode.server) {
+      final logs = _serverLogs;
+      return Card(
+        child: Column(
+          children: [
+            ListTile(
+              title: const Text('Server Logs'),
+              subtitle: Text(_serverRunning ? 'Running on port $_serverPort' : 'Stopped'),
             ),
-          ),
-          const Divider(height: 1),
-          Expanded(
-            child: ListView.builder(
-              controller: _logScroll,
-              itemCount: logs.length,
-              itemBuilder: (context, i) {
-                final text = logs[i];
-                return Padding(
-                  padding: const EdgeInsets.symmetric(
-                    horizontal: 12,
-                    vertical: 6,
-                  ),
-                  child: InkWell(
-                    onLongPress: () => _copyToClipboard(text),
-                    child: Text(text, style: const TextStyle(fontSize: 12)),
-                  ),
-                );
-              },
+            const Divider(height: 1),
+            Expanded(
+              child: ListView.builder(
+                controller: _logScroll,
+                itemCount: logs.length,
+                itemBuilder: (context, i) {
+                  final text = logs[i];
+                  return Padding(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 12,
+                      vertical: 6,
+                    ),
+                    child: InkWell(
+                      onLongPress: () => _copyToClipboard(text),
+                      child: Text(text, style: const TextStyle(fontSize: 12)),
+                    ),
+                  );
+                },
+              ),
             ),
+          ],
+        ),
+      );
+    }
+
+    // Client: show per-server cards with last RTT, avg and number of samples
+    final serverKeys = _rttsByServer.keys.toList();
+    // ensure we always show current target server even if no samples yet
+    if (!serverKeys.contains(_clientHost)) {
+      serverKeys.insert(0, _clientHost);
+      _rttsByServer.putIfAbsent(_clientHost, () => []);
+      _samplesByServer.putIfAbsent(_clientHost, () => []);
+    }
+
+    // Build a vertical list with a header card for each server and a card per sample.
+    final List<Widget> widgets = [];
+    for (final server in serverKeys) {
+      final samples = _samplesByServer[server] ?? [];
+      widgets.add(Card(
+        margin: const EdgeInsets.symmetric(vertical: 6, horizontal: 8),
+        child: ListTile(
+          title: Text('Server: $server'),
+          subtitle: Text(
+            _pingInProgress ? 'Pinging... Samples: ${samples.length}' : (samples.isNotEmpty ? 'Samples: ${samples.length}' : 'No samples yet. Press "Start 10 pings".'),
           ),
-        ],
-      ),
-    );
+          trailing: IconButton(
+            icon: const Icon(Icons.copy),
+            onPressed: () => _copyToClipboard(server),
+            tooltip: 'Copy server IP',
+          ),
+        ),
+      ));
+
+      // add each sample as a card (appear as they come in)
+      for (final s in samples) {
+        final rtt = s['rtt'] as int;
+        final ts = s['ts'] as int;
+        widgets.add(Card(
+          margin: const EdgeInsets.symmetric(vertical: 4, horizontal: 16),
+          child: ListTile(
+            dense: true,
+            title: Text('RTT: ${rtt} ms    Latency ≈ ${(rtt / 2).toStringAsFixed(1)} ms'),
+            subtitle: Text('${DateTime.fromMillisecondsSinceEpoch(ts)}'),
+            onLongPress: () => _copyToClipboard('Server:$server RTT:${rtt}ms at ${DateTime.fromMillisecondsSinceEpoch(ts)}'),
+          ),
+        ));
+      }
+
+      // show average only after sequence finishes (avg is set in _runPingSequence)
+      if (_avgByServer.containsKey(server)) {
+        final avg = _avgByServer[server]!;
+        widgets.add(Card(
+          color: Colors.grey.shade100,
+          margin: const EdgeInsets.symmetric(vertical: 6, horizontal: 12),
+          child: ListTile(
+            leading: const Icon(Icons.functions),
+            title: Text('Average RTT for $server: ${avg.toStringAsFixed(1)} ms'),
+            subtitle: Text('Avg latency ≈ ${(avg / 2).toStringAsFixed(1)} ms'),
+          ),
+        ));
+      }
+    }
+
+    return ListView(children: widgets);
   }
 }
